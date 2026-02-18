@@ -33,7 +33,7 @@ RECOVER_FRAMES           = 30
 TOUCH_IOU_THRESHOLD      = 0.05
 PROXIMITY_PX             = 100
 PRE_FALL_BUFFER_SEC      = 5.0
-OBJ_CONF_THRESHOLD       = 0.35
+OBJ_CONF_THRESHOLD       = 0.50
 SITTING_HORIZONTAL_TOL   = 0.6
 
 # Pose keypoint indices (COCO format)
@@ -232,14 +232,16 @@ def run():
 
     buffer_frames  = int(PRE_FALL_BUFFER_SEC * fps)
 
-    horiz_counts   = {}
-    upright_counts = {}
-    fallen_ids     = set()
-    sitting_log    = []   # (frame_idx, tid, label, box)
-    pre_fall_log   = []   # (frame_idx, label, box)
-    incidents      = []
-    fall_frames    = []   # (frame_idx, annotated_frame)
-    fired_frames   = set()  # prevent duplicate falls on same frame
+    horiz_counts     = {}
+    upright_counts   = {}
+    fallen_ids       = set()
+    sitting_log      = []   # (frame_idx, tid, label, box)
+    pre_fall_log     = []   # (frame_idx, label, box)
+    incidents        = []
+    fall_frames      = []   # (frame_idx, annotated_frame)
+    fired_frames     = set()  # prevent duplicate falls on same frame
+    sitting_frames   = []   # (frame_idx, annotated_frame) — one per person, first sit
+    sitting_seen_ids = set()  # tids we've already snapshotted
 
     frame_idx = 0
 
@@ -250,6 +252,20 @@ def run():
 
         # Object detection
         obj_results      = obj_model(frame, verbose=False)[0]
+        # temporary — remove after debugging
+        if frame_idx < 90:
+            for obj in obj_results.boxes:
+                label = obj_model.names[int(obj.cls[0])]
+                conf  = float(obj.conf[0])
+                box   = obj.xyxy[0].tolist()
+                if label == "bird":
+                    print(f"f{frame_idx}: BIRD detected conf={conf:.2f} box={[round(v) for v in box]}")
+                    x1,y1,x2,y2 = [int(v) for v in box]
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crop_big = cv2.resize(crop, (200, 200))  # enlarge so it's visible
+                        cv2.imshow(f"BIRD f{frame_idx} conf={conf:.2f}", crop_big)
+                        cv2.waitKey(500)  # show for 500ms then move on
         detected_objects = []
         if obj_results.boxes is not None:
             for box in obj_results.boxes:
@@ -290,9 +306,48 @@ def run():
                     person_is_sitting = is_sitting_pose(kp_xy, kp_conf)
 
                 if person_is_sitting:
+                    matched_objs = []
                     for obj in detected_objects:
                         if is_sitting_on(pbox, obj["box"], kp_xy, kp_conf):
                             sitting_log.append((frame_idx, tid, obj["label"], obj["box"]))
+                            matched_objs.append(obj)
+
+                    # Snapshot the first frame per person where sitting is confirmed
+                    if matched_objs and tid not in sitting_seen_ids:
+                        sitting_seen_ids.add(tid)
+                        vis = frame.copy()
+
+                        # Draw all detected objects (grey = not sat on, green = sat on)
+                        for obj in detected_objects:
+                            if obj in matched_objs:
+                                draw_box(vis, obj["box"], f"SITTING ON: {obj['label']}", (0, 220, 0), 3)
+                            else:
+                                draw_box(vis, obj["box"],
+                                         f"{obj['label']} [{get_risk(obj['label'])}]",
+                                         (160, 160, 160), 1)
+
+                        # Draw person box
+                        draw_box(vis, pbox, f"SITTING Person {tid}", (0, 200, 0), 2)
+
+                        # Draw hip keypoint — the seat_y point driving is_sitting_on()
+                        if kp_xy is not None and kp_conf is not None:
+                            hip_xs, hip_ys = [], []
+                            if kp_conf[KP_LEFT_HIP]  > KP_CONF_THRESHOLD:
+                                hip_xs.append(int(kp_xy[KP_LEFT_HIP][0]))
+                                hip_ys.append(int(kp_xy[KP_LEFT_HIP][1]))
+                            if kp_conf[KP_RIGHT_HIP] > KP_CONF_THRESHOLD:
+                                hip_xs.append(int(kp_xy[KP_RIGHT_HIP][0]))
+                                hip_ys.append(int(kp_xy[KP_RIGHT_HIP][1]))
+                            if hip_xs:
+                                cx = int(np.mean(hip_xs))
+                                cy = int(np.mean(hip_ys))
+                                cv2.circle(vis, (cx, cy), 10, (0, 255, 255), -1)
+                                cv2.putText(vis, "seat_y (hip)", (cx + 14, cy + 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+                        cv2.putText(vis, f"SITTING @ {round(frame_idx/fps, 2)}s", (20, 48),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 200, 0), 3)
+                        sitting_frames.append((frame_idx, vis))
 
                 # Trim sitting log
                 sitting_log = [(f,t,l,b) for f,t,l,b in sitting_log if f > cutoff]
@@ -397,6 +452,13 @@ def run():
         cv2.waitKey(1)
     cv2.destroyAllWindows()
     print(f"\nDone. {len(incidents)} fall(s) detected.")
+
+    # Save + show sitting snapshots
+    for fidx, vis in sitting_frames:
+        out_path = str(script_dir / f"sitting_frame_{fidx}.jpg")
+        cv2.imwrite(out_path, vis)
+        print(f"Saved sitting snapshot: {out_path}")
+        cv2.imshow(f"Sitting @ frame {fidx}", vis)
 
     # Show annotated fall frames
     for fidx, vis in fall_frames:
