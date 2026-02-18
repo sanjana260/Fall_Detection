@@ -2,7 +2,7 @@
 Falling Object Detector
 ========================
 Detects objects that are falling in a video, whether they were caused
-by a person, and whether they hit a person.
+by a person, and whether they hit a person — and if so, which person.
 
 Two detection methods:
   1. YOLO — detects known objects (chairs, bottles, etc.)
@@ -26,26 +26,24 @@ from pathlib import Path
 from ultralytics import YOLO
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-OBJ_CONF_THRESHOLD    = 0.35   # min YOLO confidence to count an object
-TRACK_IOU_THRESHOLD   = 0.3    # IoU to match object to existing track
-MAX_MISSED_FRAMES     = 10     # frames before a track is dropped
+OBJ_CONF_THRESHOLD    = 0.35
+TRACK_IOU_THRESHOLD   = 0.3
+MAX_MISSED_FRAMES     = 10
 
-# Falling detection
-HISTORY_FRAMES        = 10     # how many frames of position history to keep
-MIN_FALL_VELOCITY     = 4.0    # min pixels/frame downward to count as falling
-FALL_CONFIRM_FRAMES   = 5      # must be falling for this many frames to confirm
-FALL_COOLDOWN_SEC     = 2.0    # ignore new falls within this many seconds of the last
+HISTORY_FRAMES        = 10
+MIN_FALL_VELOCITY     = 4.0
+FALL_CONFIRM_FRAMES   = 5
+FALL_COOLDOWN_SEC     = 2.0
 
-# Cause / hit detection
-CAUSE_PROXIMITY_PX    = 120    # person within this distance just before fall → caused it
-CAUSE_LOOKBACK_FRAMES = 15     # how many frames before fall to check for person proximity
-HIT_IOU_THRESHOLD     = 0.05   # object bbox overlaps person bbox → hit
+CAUSE_PROXIMITY_PX    = 120
+CAUSE_LOOKBACK_FRAMES = 15
+HIT_IOU_THRESHOLD     = 0.05
 
-# Clip saving
-CLIP_BUFFER_SEC       = 1.5    # seconds before AND after fall to include in clip
+CLIP_BUFFER_SEC       = 1.5
+BG_MIN_AREA           = 5000
 
-# Background subtraction (for unknown objects like trees)
-BG_MIN_AREA           = 5000   # min contour area to count as a moving object (pixels²)
+# How close two person boxes need to be (in pixels) to count as the same person
+PERSON_MATCH_DIST     = 80
 
 # ── GEOMETRY HELPERS ──────────────────────────────────────────────────────────
 
@@ -69,10 +67,6 @@ def aspect_ratio(box):
     return w/h if h > 0 else 1.0
 
 def detect_large_moving_regions(frame, bg_subtractor):
-    """
-    Detects large moving regions using background subtraction.
-    Catches anything YOLO doesn't know about — trees, furniture, etc.
-    """
     fg_mask = bg_subtractor.apply(frame)
     kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
@@ -85,7 +79,44 @@ def detect_large_moving_regions(frame, bg_subtractor):
             regions.append([x, y, x+ww, y+hh])
     return regions
 
-# ── SIMPLE IoU TRACKER ────────────────────────────────────────────────────────
+# ── PERSON TRACKER ────────────────────────────────────────────────────────────
+# Lightweight — just assigns consistent IDs to people across frames
+# by matching bbox centers within PERSON_MATCH_DIST pixels.
+
+class PersonTracker:
+    def __init__(self):
+        self.persons  = {}   # person_id → last known box
+        self.next_id  = 0
+
+    def update(self, boxes):
+        """
+        boxes: list of [x1,y1,x2,y2]
+        Returns list of {"id": int, "box": [...]}
+        """
+        updated = {}
+        unmatched = list(range(len(boxes)))
+
+        for pid, last_box in self.persons.items():
+            best_dist = PERSON_MATCH_DIST
+            best_i    = None
+            for i in unmatched:
+                d = center_dist(last_box, boxes[i])
+                if d < best_dist:
+                    best_dist = d
+                    best_i    = i
+            if best_i is not None:
+                updated[pid] = boxes[best_i]
+                unmatched.remove(best_i)
+
+        for i in unmatched:
+            updated[self.next_id] = boxes[i]
+            self.next_id += 1
+
+        self.persons = updated
+        return [{"id": pid, "box": box} for pid, box in self.persons.items()]
+
+
+# ── OBJECT TRACKER ────────────────────────────────────────────────────────────
 
 class Track:
     def __init__(self, track_id, label, box, frame_idx):
@@ -126,7 +157,7 @@ class Track:
         return self.history[0][4] < 0.8 and self.history[-1][4] > 1.2
 
 
-class Tracker:
+class ObjectTracker:
     def __init__(self):
         self.tracks  = []
         self.next_id = 0
@@ -190,19 +221,16 @@ def run(video_path: str):
     h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {video_path.name}  |  {total} frames @ {fps:.1f}fps\n")
 
-    tracker        = Tracker()
+    obj_tracker    = ObjectTracker()
+    person_tracker = PersonTracker()
     bg_subtractor  = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40)
-    incidents      = []
-    last_fall_sec  = -999.0   # cooldown tracker
 
-    # Rolling frame buffer for clip extraction
+    incidents     = []
+    last_fall_sec = -999.0
     max_buffer    = int(CLIP_BUFFER_SEC * fps) * 2 + 10
-    frame_buffer  = []   # list of (frame_idx, annotated_frame)
-
-    # Active clip writers: track_id → {"writer": cv2.VideoWriter, "end_frame": int, "path": str}
+    frame_buffer  = []
     active_clips  = {}
-
-    frame_idx = 0
+    frame_idx     = 0
 
     while True:
         ret, frame = cap.read()
@@ -211,9 +239,9 @@ def run(video_path: str):
 
         results = obj_model(frame, verbose=False)[0]
 
-        # ── People and YOLO objects ───────────────────────────────────────────
-        person_boxes = []
-        detections   = []
+        # ── Detect people and objects ─────────────────────────────────────────
+        raw_person_boxes = []
+        detections       = []
 
         if results.boxes is not None:
             for box in results.boxes:
@@ -223,26 +251,28 @@ def run(video_path: str):
                 b      = box.xyxy[0].tolist()
                 if label == "person":
                     if conf > 0.4:
-                        person_boxes.append(b)
+                        raw_person_boxes.append(b)
                 elif conf > OBJ_CONF_THRESHOLD:
-                    if all(bbox_iou(b, pb) < 0.4 for pb in person_boxes):
+                    if all(bbox_iou(b, pb) < 0.4 for pb in raw_person_boxes):
                         detections.append({"label": label, "box": b})
 
         # ── Background subtraction ────────────────────────────────────────────
         unknown_regions = detect_large_moving_regions(frame, bg_subtractor)
         for region in unknown_regions:
-            already = any(bbox_iou(region, d["box"]) > 0.3 for d in detections)
-            is_person = any(bbox_iou(region, pb) > 0.3 for pb in person_boxes)
+            already   = any(bbox_iou(region, d["box"]) > 0.3 for d in detections)
+            is_person = any(bbox_iou(region, pb) > 0.3 for pb in raw_person_boxes)
             if not already and not is_person:
                 detections.append({"label": "unknown_object", "box": region})
 
-        # ── Update tracker ────────────────────────────────────────────────────
-        active_tracks = tracker.update(detections, frame_idx)
+        # ── Update trackers ───────────────────────────────────────────────────
+        persons       = person_tracker.update(raw_person_boxes)  # [{"id", "box"}, ...]
+        active_tracks = obj_tracker.update(detections, frame_idx)
 
-        # ── Draw all tracks ───────────────────────────────────────────────────
+        # ── Draw ──────────────────────────────────────────────────────────────
         annotated = frame.copy()
-        for pb in person_boxes:
-            draw_box(annotated, pb, "person", (0, 200, 0), 2)
+
+        for p in persons:
+            draw_box(annotated, p["box"], f"Person {p['id']}", (0, 200, 0), 2)
 
         for track in active_tracks:
             if track.is_falling:
@@ -264,12 +294,12 @@ def run(video_path: str):
         cv2.putText(annotated, f"Frame {frame_idx}/{total}  |  Falls: {len(incidents)}",
                     (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
-        # ── Rolling buffer of annotated frames ────────────────────────────────
+        # ── Rolling frame buffer ──────────────────────────────────────────────
         frame_buffer.append((frame_idx, annotated.copy()))
         if len(frame_buffer) > max_buffer:
             frame_buffer.pop(0)
 
-        # ── Write to any active clip writers ─────────────────────────────────
+        # ── Write active clips ────────────────────────────────────────────────
         for tid, clip in list(active_clips.items()):
             clip["writer"].write(annotated)
             if frame_idx >= clip["end_frame"]:
@@ -282,14 +312,13 @@ def run(video_path: str):
             if track.fall_logged:
                 continue
 
-            vy = track.get_velocity_y()
+            vy        = track.get_velocity_y()
+            fall_time = round(frame_idx / fps, 2)
 
             if vy > MIN_FALL_VELOCITY:
                 track.fall_velocity.append(vy)
             else:
                 track.fall_velocity = []
-
-            fall_time = round(frame_idx / fps, 2)
 
             if (len(track.fall_velocity) >= FALL_CONFIRM_FRAMES
                     and not track.is_falling
@@ -301,20 +330,27 @@ def run(video_path: str):
                 last_fall_sec     = fall_time
 
                 # Did a person cause it?
-                person_caused = False
+                person_caused    = False
+                caused_by_person = None
                 for (hf, hcx, hcy, hbox, _) in track.history:
                     if frame_idx - hf > CAUSE_LOOKBACK_FRAMES:
                         continue
-                    for pb in person_boxes:
-                        if center_dist(hbox, pb) < CAUSE_PROXIMITY_PX:
-                            person_caused = True
+                    for p in persons:
+                        if center_dist(hbox, p["box"]) < CAUSE_PROXIMITY_PX:
+                            person_caused    = True
+                            caused_by_person = p["id"]
                             break
+                    if person_caused:
+                        break
 
-                # Did it hit a person?
-                hit_person = any(
-                    bbox_iou(track.box, pb) > HIT_IOU_THRESHOLD
-                    for pb in person_boxes
-                )
+                # Did it hit a person — and which one?
+                hit_person    = False
+                hit_person_id = None
+                for p in persons:
+                    if bbox_iou(track.box, p["box"]) > HIT_IOU_THRESHOLD:
+                        hit_person    = True
+                        hit_person_id = p["id"]
+                        break
 
                 incident = {
                     "object"                   : track.label,
@@ -324,42 +360,42 @@ def run(video_path: str):
                     "avg_velocity_px_per_frame": round(float(np.mean(track.fall_velocity)), 2),
                     "aspect_ratio_changed"     : track.aspect_ratio_changed(),
                     "person_caused"            : person_caused,
+                    "caused_by_person_id"      : caused_by_person,
                     "hit_person"               : hit_person,
+                    "hit_person_id"            : hit_person_id,
                 }
                 incidents.append(incident)
 
-                print(f"⚠️  FALLING OBJECT: {track.label} (track {track.track_id}) @ {fall_time}s")
+                print(f"\n⚠️  FALLING OBJECT: {track.label} (track {track.track_id}) @ {fall_time}s")
                 print(f"   velocity     : {incident['avg_velocity_px_per_frame']} px/frame")
                 print(f"   tipped over  : {incident['aspect_ratio_changed']}")
-                print(f"   person caused: {person_caused}")
-                print(f"   hit person   : {hit_person}")
+                print(f"   person caused: {person_caused}" +
+                      (f" (Person {caused_by_person})" if caused_by_person is not None else ""))
+                print(f"   hit person   : {hit_person}" +
+                      (f" (Person {hit_person_id})" if hit_person_id is not None else ""))
 
-                # ── Start clip writer ─────────────────────────────────────────
+                # ── Save clip ─────────────────────────────────────────────────
                 clip_path = str(video_path.parent /
                                 f"clip_{track.label}_t{fall_time}s.mp4")
                 writer = cv2.VideoWriter(
                     clip_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
-                # Write buffered pre-fall frames
                 clip_start = frame_idx - int(CLIP_BUFFER_SEC * fps)
                 for (fi, bf) in frame_buffer:
                     if fi >= clip_start:
                         writer.write(bf)
-
                 active_clips[track.track_id] = {
                     "writer"   : writer,
                     "end_frame": frame_idx + int(CLIP_BUFFER_SEC * fps),
                     "path"     : clip_path,
                 }
 
-        # ── Display ───────────────────────────────────────────────────────────
         cv2.imshow("Falling Object Detection", annotated)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
         frame_idx += 1
 
-    # Close any still-open clip writers
+    # Close any remaining clip writers
     for tid, clip in active_clips.items():
         clip["writer"].release()
         print(f"   clip saved   : {clip['path']}")
@@ -373,8 +409,10 @@ def run(video_path: str):
     print("\n" + "="*60)
     for inc in incidents:
         print(f"\n{inc['object'].upper()} fell @ {inc['fell_at_sec']}s")
-        print(f"  Person caused it : {inc['person_caused']}")
-        print(f"  Hit person       : {inc['hit_person']}")
+        print(f"  Person caused it : {inc['person_caused']}" +
+              (f" (Person {inc['caused_by_person_id']})" if inc['caused_by_person_id'] is not None else ""))
+        print(f"  Hit person       : {inc['hit_person']}" +
+              (f" (Person {inc['hit_person_id']})" if inc['hit_person_id'] is not None else ""))
         print(f"  Tipped over      : {inc['aspect_ratio_changed']}")
 
     print("\nFull JSON:")

@@ -950,6 +950,22 @@ def run():
             if abs(fo["fell_at_frame"] - fall_frm) <= buffer_frames
         ]
 
+    # Flag background falling objects: fell independently with no person involvement
+    for fo in falling_obj_incidents:
+        fo["is_background_fall"] = not fo["person_caused_it"] and not fo["hit_person"]
+
+    background_falls = [fo for fo in falling_obj_incidents if fo["is_background_fall"]]
+
+    # Add background falls list to every person-fall summary
+    bg_summary = [
+        {"object"         : fo["object"],
+         "fell_at_time_sec": fo["fell_at_time_sec"],
+         "injury_risk"    : fo["injury_risk"]}
+        for fo in background_falls
+    ]
+    for inc in incidents:
+        inc["summary"]["background_falling_objects"] = bg_summary
+
     print("\n" + "="*60)
     print("FALL SUMMARY REPORT")
     print("="*60)
@@ -980,19 +996,26 @@ def run():
             print(f"  Falling objects    : {fo_str}")
         else:
             print(f"  Falling objects    : none near this fall")
+        bg = s.get("background_falling_objects", [])
+        if bg:
+            print(f"  Background falls   : {', '.join(f['object'] for f in bg)}"
+                  f"  (no person involved)")
+        else:
+            print(f"  Background falls   : none detected")
 
-    if falling_obj_incidents:
-        print(f"\nFALLING OBJECT INCIDENTS ({len(falling_obj_incidents)} total):")
-        for fo in falling_obj_incidents:
-            print(f"  {fo['object']:20s} @ {fo['fell_at_time_sec']}s"
-                  f"  person_caused={str(fo['person_caused_it']):5s}"
-                  f"  hit_person={str(fo['hit_person']):5s}"
-                  f"  risk={fo['injury_risk']}")
+    if background_falls:
+        print(f"\nBACKGROUND FALLING OBJECTS ({len(background_falls)} — no person involved):")
+        for fo in background_falls:
+            print(f"  {fo['object']:20s} @ {fo['fell_at_time_sec']}s  risk={fo['injury_risk']}")
+    elif falling_obj_incidents:
+        print(f"\nNo background falling objects detected"
+              f" ({len(falling_obj_incidents)} falling object(s) all involved a person).")
 
     # ── Save JSON report ──────────────────────────────────────────────────────
     report = {
-        "person_fall_incidents"   : incidents,
-        "falling_object_incidents": falling_obj_incidents,
+        "person_fall_incidents"    : incidents,
+        "falling_object_incidents" : falling_obj_incidents,
+        "background_falling_objects": background_falls,
     }
     json_path = json_dir / f"{video_stem}.json"
     with open(json_path, "w") as f:
