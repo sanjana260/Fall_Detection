@@ -692,6 +692,53 @@ def run():
                         dur_snap = f"{video_stem}_p{tid}_during_fall.jpg"
                         cv2.imwrite(str(json_dir / dur_snap), snap)
 
+                    # ── Build summary ─────────────────────────────────────────
+                    _risk_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
+
+                    # Objects present/touching before the fall
+                    _before_objs = list(dict.fromkeys(
+                        [s["object"] for s in sitting_summary] +
+                        [obj["object"] for obj in interactions
+                         if obj.get("timing") == "BEFORE_FALL"]
+                    ))
+
+                    # Highest-risk body part at fall moment (after_fall added later)
+                    _highest_risk = None
+                    _best_rank    = 999
+                    for _entries in [while_falling_touches, during_touches]:
+                        for _e in _entries:
+                            _rank = _risk_order.get(_e.get("risk", "UNKNOWN"), 3)
+                            if _rank < _best_rank and _e.get("body_parts"):
+                                _best_rank    = _rank
+                                _highest_risk = {
+                                    "body_parts": _e["body_parts"],
+                                    "object"    : _e["object"],
+                                    "risk"      : _e["risk"],
+                                }
+
+                    _ffc_data  = first_floor_hit.get(tid)
+                    _ffc_label = ("flat" if _ffc_data["flat_fall"] else _ffc_data["body_part"]) \
+                                 if _ffc_data else None
+
+                    _likely_causes = [obj["object"] for obj in interactions
+                                      if obj.get("likely_cause")]
+
+                    summary = {
+                        "fell"                  : True,
+                        "fall_time_sec"         : fall_time,
+                        "pre_fall_posture"      : pre_fall_posture.get(tid, "unknown"),
+                        "was_sitting_on"        : [s["object"] for s in sitting_summary],
+                        "objects_touching"      : {
+                            "before_fall"   : _before_objs,
+                            "while_falling" : [e["object"] for e in while_falling_touches],
+                            "during_fall"   : [e["object"] for e in during_touches],
+                            "after_fall"    : [],   # populated in later frames
+                        },
+                        "first_floor_contact"   : _ffc_label,
+                        "highest_risk_body_part": _highest_risk,
+                        "likely_cause_objects"  : _likely_causes,
+                    }
+
                     incidents.append({
                         "person_track_id"    : tid,
                         "fall_frame"         : frame_idx,
@@ -708,29 +755,26 @@ def run():
                             "after_fall"            : [],   # populated in subsequent frames
                             "after_fall_snapshot"   : None, # set when first after-fall touch seen
                         },
+                        "summary"            : summary,
                     })
                     active_fall_incidents[tid] = incidents[-1]
 
-                    print(f"\n⚠️  FALL — Person {tid} @ {fall_time}s (frame {frame_idx})")
-                    print(f"  Pre-fall posture:     {pre_fall_posture.get(tid, 'unknown')}")
-                    print(f"  Sitting on before fall: {[s['object'] for s in sitting_summary] or 'nothing detected'}")
-                    ffc = first_floor_hit.get(tid)
-                    if ffc:
-                        label = "FLAT FALL" if ffc["flat_fall"] else ffc["body_part"]
-                        print(f"  First floor contact:  {label} @ {ffc['time_sec']}s"
-                              f"  (parts: {', '.join(ffc['all_parts'])})")
+                    # ── Print ONLY the summary ─────────────────────────────────
+                    _ot = summary["objects_touching"]
+                    print(f"\n⚠️  FALL — Person {tid} @ {fall_time}s")
+                    print(f"  Pre-fall posture   : {summary['pre_fall_posture']}")
+                    print(f"  Was sitting on     : {', '.join(summary['was_sitting_on']) or 'nothing detected'}")
+                    print(f"  Objects touching   :")
+                    print(f"    Before fall      : {', '.join(_ot['before_fall'])   or 'none'}")
+                    print(f"    While falling    : {', '.join(_ot['while_falling']) or 'none'}")
+                    print(f"    During fall      : {', '.join(_ot['during_fall'])   or 'none'}")
+                    print(f"  First floor contact: {_ffc_label or 'not yet detected'}")
+                    if _highest_risk:
+                        print(f"  Highest-risk touch : {', '.join(_highest_risk['body_parts'])}"
+                              f" → {_highest_risk['object']} ({_highest_risk['risk']})")
                     else:
-                        print(f"  First floor contact:  not yet detected")
-                    for obj in interactions:
-                        cause = " ← LIKELY CAUSE" if obj["likely_cause"] else ""
-                        bp_str = f"  body_parts=[{', '.join(obj['body_parts'])}]" if obj["body_parts"] else ""
-                        print(f"  {obj['object']:20s}  touch={str(obj['touching']):5s}  "
-                              f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}{bp_str}")
-                    for phase_label, entries in [("While falling", while_falling_touches),
-                                                  ("During fall  ", during_touches)]:
-                        for e in entries:
-                            print(f"  [{phase_label}] {e['object']:16s} → {', '.join(e['body_parts'])}"
-                                  f"  (risk={e['risk']})")
+                        print(f"  Highest-risk touch : none detected")
+                    print(f"  Likely cause       : {', '.join(_likely_causes) or 'unknown'}")
 
                     # Annotate fall frame
                     vis = frame.copy()
@@ -778,43 +822,59 @@ def run():
         cv2.waitKey(1)
     cv2.destroyAllWindows()
 
-    # Print full summary
-    print("\n" + "="*60)
+    # ── Finalize summaries with after_fall data, then print ───────────────────
+    _risk_order_final = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
     for inc in incidents:
-        print(f"\nFALL — Person {inc['person_track_id']} @ {inc['fall_time_sec']}s")
-        print(f"  Pre-fall posture:    {inc.get('pre_fall_posture', 'unknown')}")
-        print(f"  Sitting on (before fall):")
-        if inc["was_sitting_on"]:
-            for s in inc["was_sitting_on"]:
-                print(f"    {s['object']:20s}  {s['seconds_before_fall']}s before fall")
-        else:
-            print("    Nothing detected.")
-        ffc = inc.get("first_floor_contact")
-        if ffc:
-            label = "FLAT FALL" if ffc["flat_fall"] else ffc["body_part"]
-            print(f"  First floor contact: {label} @ {ffc['time_sec']}s"
-                  f"  (parts: {', '.join(ffc['all_parts'])})")
-        else:
-            print(f"  First floor contact: not detected")
-        print(f"  Object interactions:")
-        if inc["object_interactions"]:
-            for obj in inc["object_interactions"]:
-                cause = " ← LIKELY CAUSE" if obj["likely_cause"] else ""
-                bp_str = f"  [{', '.join(obj['body_parts'])}]" if obj.get("body_parts") else ""
-                print(f"    {obj['object']:20s}  touch={str(obj['touching']):5s}  "
-                      f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}{bp_str}")
-        else:
-            print("    None.")
+        s   = inc.get("summary", {})
         bpt = inc.get("body_part_touches", {})
-        has_any = any(bpt.get(k) for k in ("while_falling", "during_fall", "after_fall"))
-        if has_any:
-            print(f"  Body-part touches by phase:")
-            for phase_key, phase_label in [("while_falling", "While falling"),
-                                            ("during_fall",   "During fall  "),
-                                            ("after_fall",    "After fall   ")]:
-                for e in bpt.get(phase_key, []):
-                    print(f"    [{phase_label}] {e['object']:18s} → {', '.join(e['body_parts'])}"
-                          f"  (risk={e['risk']})")
+        after_fall = bpt.get("after_fall", [])
+
+        # Fill in after_fall objects now that we have them
+        s.setdefault("objects_touching", {})["after_fall"] = \
+            list(dict.fromkeys(e["object"] for e in after_fall))
+
+        # Recompute highest-risk body part across all three phases
+        _best_rank = 999
+        _highest   = None
+        for _entries in [bpt.get("while_falling", []),
+                         bpt.get("during_fall",   []),
+                         after_fall]:
+            for _e in _entries:
+                _rank = _risk_order_final.get(_e.get("risk", "UNKNOWN"), 3)
+                if _rank < _best_rank and _e.get("body_parts"):
+                    _best_rank = _rank
+                    _highest   = {"body_parts": _e["body_parts"],
+                                  "object"    : _e["object"],
+                                  "risk"      : _e["risk"]}
+        s["highest_risk_body_part"] = _highest
+
+        # Update first_floor_contact label (may have been detected after incident fired)
+        _ffc = inc.get("first_floor_contact")
+        if _ffc:
+            s["first_floor_contact"] = "flat" if _ffc["flat_fall"] else _ffc["body_part"]
+
+    print("\n" + "="*60)
+    print("FALL SUMMARY REPORT")
+    print("="*60)
+    for inc in incidents:
+        s  = inc.get("summary", {})
+        ot = s.get("objects_touching", {})
+        hr = s.get("highest_risk_body_part")
+        print(f"\nFALL — Person {inc['person_track_id']} @ {inc['fall_time_sec']}s")
+        print(f"  Pre-fall posture   : {s.get('pre_fall_posture', 'unknown')}")
+        print(f"  Was sitting on     : {', '.join(s.get('was_sitting_on', [])) or 'nothing detected'}")
+        print(f"  Objects touching   :")
+        print(f"    Before fall      : {', '.join(ot.get('before_fall',   [])) or 'none'}")
+        print(f"    While falling    : {', '.join(ot.get('while_falling', [])) or 'none'}")
+        print(f"    During fall      : {', '.join(ot.get('during_fall',   [])) or 'none'}")
+        print(f"    After fall       : {', '.join(ot.get('after_fall',    [])) or 'none'}")
+        print(f"  First floor contact: {s.get('first_floor_contact') or 'not detected'}")
+        if hr:
+            print(f"  Highest-risk touch : {', '.join(hr['body_parts'])}"
+                  f" → {hr['object']} ({hr['risk']})")
+        else:
+            print(f"  Highest-risk touch : none detected")
+        print(f"  Likely cause       : {', '.join(s.get('likely_cause_objects', [])) or 'unknown'}")
 
     # ── Save JSON report ──────────────────────────────────────────────────────
     json_path  = json_dir / f"{video_stem}.json"
