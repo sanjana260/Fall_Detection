@@ -35,6 +35,7 @@ PROXIMITY_PX             = 100
 PRE_FALL_BUFFER_SEC      = 5.0
 OBJ_CONF_THRESHOLD       = 0.50
 SITTING_HORIZONTAL_TOL   = 0.6
+TOUCH_MARGIN_PX          = 25   # px: keypoint within this distance of obj box = touching
 
 # Pose keypoint indices (COCO format)
 KP_LEFT_SHOULDER  = 5
@@ -43,7 +44,28 @@ KP_LEFT_HIP       = 11
 KP_RIGHT_HIP      = 12
 KP_LEFT_KNEE      = 13
 KP_RIGHT_KNEE     = 14
+KP_LEFT_ANKLE     = 15
+KP_RIGHT_ANKLE    = 16
 KP_CONF_THRESHOLD = 0.3   # min keypoint confidence to use it
+
+FLOOR_TOLERANCE_PX  = 30   # ky >= floor_y - tolerance → keypoint is at floor level
+FLAT_FALL_MIN_PARTS = 4    # this many parts at floor simultaneously → flat fall
+# Feet/ankles are always near floor when standing — exclude them so we detect
+# the first *interesting* impact: head, knee, hip, palm, shoulder, etc.
+FLOOR_EXCLUDED_PARTS = {"left_ankle", "right_ankle"}
+
+# Names for all 17 COCO keypoints
+KP_NAMES = {
+    0:  "nose",
+    1:  "left_eye",      2:  "right_eye",
+    3:  "left_ear",      4:  "right_ear",
+    5:  "left_shoulder", 6:  "right_shoulder",
+    7:  "left_elbow",    8:  "right_elbow",
+    9:  "left_wrist",    10: "right_wrist",
+    11: "left_hip",      12: "right_hip",
+    13: "left_knee",     14: "right_knee",
+    15: "left_ankle",    16: "right_ankle",
+}
 
 HIGH_RISK   = {"chair", "dining table", "bench", "bed", "sofa", "couch",
                "toilet", "sink", "oven", "refrigerator", "scissors", "knife", "fork"}
@@ -219,6 +241,71 @@ def show_frame(frame, title="Frame"):
     cv2.imshow(title, frame)
     cv2.waitKey(1)
 
+def body_parts_touching_obj(kp_xy, kp_conf, obj_box):
+    """
+    Returns list of body-part names whose keypoint is strictly inside obj_box.
+    Skips low-confidence or undetected (0,0) keypoints.
+    """
+    ox1, oy1, ox2, oy2 = obj_box
+    touching = []
+    for idx, name in KP_NAMES.items():
+        if idx >= len(kp_conf) or kp_conf[idx] < KP_CONF_THRESHOLD:
+            continue
+        kx, ky = float(kp_xy[idx][0]), float(kp_xy[idx][1])
+        if kx == 0.0 and ky == 0.0:
+            continue
+        if ox1 <= kx <= ox2 and oy1 <= ky <= oy2:
+            touching.append(name)
+    return touching
+
+def draw_touch_snapshot(frame, pbox, detected_objects, kp_xy, kp_conf, phase_label):
+    """
+    Returns an annotated copy of frame showing body-part touches.
+    Touching keypoints: large yellow dot + name label.
+    Objects with touches: cyan box with touching part names.
+    All other keypoints: small grey dot.
+    """
+    vis = frame.copy()
+
+    # Recompute which parts touch which objects (so snapshot is always consistent)
+    obj_touching = {}
+    for obj in detected_objects:
+        parts = body_parts_touching_obj(kp_xy, kp_conf, obj["box"])
+        if parts:
+            obj_touching[obj["label"]] = parts
+    all_touching_parts = {bp for pts in obj_touching.values() for bp in pts}
+
+    # Draw objects
+    for obj in detected_objects:
+        parts = obj_touching.get(obj["label"], [])
+        if parts:
+            draw_box(vis, obj["box"],
+                     f"{obj['label']}: {', '.join(parts)}", (0, 220, 220), 3)
+        else:
+            draw_box(vis, obj["box"], obj["label"], (160, 160, 160), 1)
+
+    # Draw person bounding box
+    draw_box(vis, pbox, "Person", (255, 255, 255), 2)
+
+    # Draw keypoints
+    for idx, name in KP_NAMES.items():
+        if idx >= len(kp_conf) or kp_conf[idx] < KP_CONF_THRESHOLD:
+            continue
+        kx, ky = int(kp_xy[idx][0]), int(kp_xy[idx][1])
+        if kx == 0 and ky == 0:
+            continue
+        if name in all_touching_parts:
+            cv2.circle(vis, (kx, ky), 8, (0, 255, 255), -1)
+            cv2.putText(vis, name, (kx + 10, ky + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        else:
+            cv2.circle(vis, (kx, ky), 4, (180, 180, 180), -1)
+
+    # Phase banner
+    cv2.putText(vis, phase_label, (20, 48),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 200, 255), 3)
+    return vis
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def run():
@@ -226,6 +313,11 @@ def run():
     obj_model  = YOLO(script_dir / "yolov8n.pt")
     pose_model = YOLO(script_dir / "yolov8n-pose.pt")
     print("Models loaded.")
+
+    # Output directory — created now so snapshots can be saved during the loop
+    video_stem = Path(VIDEO_PATH).stem
+    json_dir   = script_dir / "jsondescriptions"
+    json_dir.mkdir(exist_ok=True)
 
     cap   = cv2.VideoCapture(VIDEO_PATH)
     fps   = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -242,8 +334,15 @@ def run():
     incidents        = []
     fall_frames      = []   # (frame_idx, annotated_frame)
     fired_frames     = set()  # prevent duplicate falls on same frame
-    sitting_frames   = []   # (frame_idx, annotated_frame) — one per person, first sit
-    sitting_seen_ids = set()  # tids we've already snapshotted
+    sitting_frames        = []   # (frame_idx, annotated_frame) — one per person, first sit
+    sitting_seen_ids      = set()  # tids we've already snapshotted
+    fall_touch_log        = []   # (tid, {frame,time_sec,phase,object,risk,body_parts})
+    active_fall_incidents = {}   # tid -> incident dict (mutable ref; after_fall appended live)
+    wf_snap_paths         = {}   # tid -> filename of while_falling snapshot
+    after_fall_snapped    = set()  # tids whose after_fall snapshot has been saved
+    ankle_y_history       = {}   # tid -> list of y samples taken when person is upright
+    floor_y_est           = {}   # tid -> estimated floor y coordinate
+    first_floor_hit       = {}   # tid -> floor contact info dict
 
     frame_idx = 0
 
@@ -348,6 +447,22 @@ def run():
                 # Trim sitting log
                 sitting_log = [(f,t,l,b) for f,t,l,b in sitting_log if f > cutoff]
 
+                # ── Floor y estimation (only when upright and not sitting) ────
+                if horiz_counts[tid] == 0 and not person_is_sitting:
+                    # Use bbox bottom as proxy; prefer ankle keypoints if available
+                    y_sample = pbox[3]
+                    if kp_xy is not None:
+                        for ak_idx in (KP_LEFT_ANKLE, KP_RIGHT_ANKLE):
+                            if kp_conf[ak_idx] > KP_CONF_THRESHOLD:
+                                ay = float(kp_xy[ak_idx][1])
+                                if ay > 0:
+                                    y_sample = max(y_sample, ay)
+                    history = ankle_y_history.setdefault(tid, [])
+                    history.append(y_sample)
+                    if len(history) > 60:
+                        ankle_y_history[tid] = history[-60:]
+                    floor_y_est[tid] = max(history) + 5  # small buffer below lowest point
+
                 # ── Fall detection ────────────────────────────
                 if is_fallen_pose(kp_xy, kp_conf, pbox) if kp_xy is not None else is_horizontal(pbox):
 
@@ -356,6 +471,129 @@ def run():
                 else:
                     upright_counts[tid] += 1
                     horiz_counts[tid]    = 0
+
+                # ── Body-part touch logging (WHILE_FALLING / AFTER_FALL) ──────
+                fall_phase = None
+                if tid in fallen_ids:
+                    fall_phase = "AFTER_FALL"
+                elif horiz_counts[tid] >= 1:
+                    fall_phase = "WHILE_FALLING"
+
+                if fall_phase and kp_xy is not None:
+                    any_touch_this_frame = False
+                    for obj in detected_objects:
+                        parts = body_parts_touching_obj(kp_xy, kp_conf, obj["box"])
+                        if not parts:
+                            continue
+                        any_touch_this_frame = True
+                        entry = {
+                            "frame"     : frame_idx,
+                            "time_sec"  : round(frame_idx / fps, 2),
+                            "phase"     : fall_phase,
+                            "object"    : obj["label"],
+                            "risk"      : get_risk(obj["label"]),
+                            "body_parts": parts,
+                        }
+                        fall_touch_log.append((tid, entry))
+                        if fall_phase == "AFTER_FALL" and tid in active_fall_incidents:
+                            af = active_fall_incidents[tid]["body_part_touches"]["after_fall"]
+                            existing = next((e for e in af if e["object"] == obj["label"]), None)
+                            if existing is None:
+                                existing = {"object": obj["label"],
+                                            "risk"  : get_risk(obj["label"]),
+                                            "body_parts": []}
+                                af.append(existing)
+                            seen_bp = set(existing["body_parts"])
+                            for bp in parts:
+                                if bp not in seen_bp:
+                                    existing["body_parts"].append(bp)
+                                    seen_bp.add(bp)
+
+                    # ── Touch snapshots ───────────────────────────────────────
+                    if any_touch_this_frame:
+                        if fall_phase == "WHILE_FALLING" and tid not in wf_snap_paths:
+                            snap = draw_touch_snapshot(
+                                frame, pbox, detected_objects, kp_xy, kp_conf,
+                                f"WHILE FALLING — Person {tid} @ {round(frame_idx/fps,2)}s")
+                            fname = f"{video_stem}_p{tid}_while_falling.jpg"
+                            cv2.imwrite(str(json_dir / fname), snap)
+                            wf_snap_paths[tid] = fname
+
+                        elif (fall_phase == "AFTER_FALL"
+                              and tid not in after_fall_snapped
+                              and tid in active_fall_incidents):
+                            snap = draw_touch_snapshot(
+                                frame, pbox, detected_objects, kp_xy, kp_conf,
+                                f"AFTER FALL — Person {tid} @ {round(frame_idx/fps,2)}s")
+                            fname = f"{video_stem}_p{tid}_after_fall.jpg"
+                            cv2.imwrite(str(json_dir / fname), snap)
+                            after_fall_snapped.add(tid)
+                            active_fall_incidents[tid]["body_part_touches"]["after_fall_snapshot"] = fname
+
+                # ── First floor contact ──────────────────────────────────────
+                if fall_phase and tid not in first_floor_hit and kp_xy is not None:
+                    fh       = frame.shape[0]
+                    floor_y  = floor_y_est.get(tid, fh * 0.85)
+
+                    at_floor = []
+                    for idx, name in KP_NAMES.items():
+                        if idx >= len(kp_conf) or kp_conf[idx] < KP_CONF_THRESHOLD:
+                            continue
+                        ky = float(kp_xy[idx][1])
+                        if ky <= 0:
+                            continue
+                        if ky >= floor_y - FLOOR_TOLERANCE_PX:
+                            at_floor.append((name, ky))
+
+                    # Exclude feet/ankles — they're always near the floor;
+                    # we want the first non-foot part to make impact.
+                    at_floor_impact = [(n, y) for n, y in at_floor
+                                       if n not in FLOOR_EXCLUDED_PARTS]
+                    if at_floor_impact:
+                        at_floor_impact.sort(key=lambda x: x[1], reverse=True)
+                        is_flat  = len(at_floor_impact) >= FLAT_FALL_MIN_PARTS
+                        primary  = "flat" if is_flat else at_floor_impact[0][0]
+                        hit_info = {
+                            "body_part" : primary,
+                            "all_parts" : [n for n, _ in at_floor_impact],
+                            "flat_fall" : is_flat,
+                            "frame"     : frame_idx,
+                            "time_sec"  : round(frame_idx / fps, 2),
+                            "snapshot"  : None,
+                        }
+
+                        # Annotated floor-contact snapshot
+                        vis_fc    = frame.copy()
+                        floor_set = {n for n, _ in at_floor_impact}
+                        draw_box(vis_fc, pbox, f"Person {tid}", (255, 255, 255), 2)
+                        for idx2, name2 in KP_NAMES.items():
+                            if idx2 >= len(kp_conf) or kp_conf[idx2] < KP_CONF_THRESHOLD:
+                                continue
+                            kx2, ky2 = int(kp_xy[idx2][0]), int(kp_xy[idx2][1])
+                            if kx2 == 0 and ky2 == 0:
+                                continue
+                            if name2 in floor_set:
+                                cv2.circle(vis_fc, (kx2, ky2), 10, (0, 100, 255), -1)
+                                cv2.putText(vis_fc, name2, (kx2 + 10, ky2 + 5),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 100, 255), 1)
+                            else:
+                                cv2.circle(vis_fc, (kx2, ky2), 4, (180, 180, 180), -1)
+                        cv2.line(vis_fc, (0, int(floor_y)), (vis_fc.shape[1], int(floor_y)),
+                                 (0, 160, 160), 2)
+                        cv2.putText(vis_fc, "est. floor", (8, int(floor_y) - 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 160, 160), 1)
+                        banner = (f"FLOOR CONTACT: {'FLAT' if is_flat else primary}"
+                                  f" — Person {tid} @ {round(frame_idx/fps, 2)}s")
+                        cv2.putText(vis_fc, banner, (20, 48),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 100, 255), 3)
+                        fc_fname = f"{video_stem}_p{tid}_floor_contact.jpg"
+                        cv2.imwrite(str(json_dir / fc_fname), vis_fc)
+                        hit_info["snapshot"] = fc_fname
+
+                        first_floor_hit[tid] = hit_info
+                        # Also update the incident if it has already been fired
+                        if tid in active_fall_incidents:
+                            active_fall_incidents[tid]["first_floor_contact"] = hit_info
 
                 # ── New fall event ────────────────────────────
                 if (tid not in fallen_ids
@@ -379,6 +617,33 @@ def run():
                             seen[s["object"]] = s
                     sitting_summary = list(seen.values())
 
+                    # WHILE_FALLING: body-part touches from frames leading up to this fall
+                    wf_entries = [e for (t, e) in fall_touch_log
+                                  if t == tid and e["phase"] == "WHILE_FALLING"]
+                    wf_by_obj  = {}
+                    for e in wf_entries:
+                        o = e["object"]
+                        if o not in wf_by_obj:
+                            wf_by_obj[o] = {"object": o, "risk": e["risk"], "body_parts": set()}
+                        wf_by_obj[o]["body_parts"].update(e["body_parts"])
+                    while_falling_touches = [
+                        {"object": v["object"], "risk": v["risk"],
+                         "body_parts": sorted(v["body_parts"])}
+                        for v in wf_by_obj.values()
+                    ]
+
+                    # DURING_FALL: body-part touches at this exact frame
+                    during_touches = []
+                    if kp_xy is not None:
+                        for obj in detected_objects:
+                            parts = body_parts_touching_obj(kp_xy, kp_conf, obj["box"])
+                            if parts:
+                                during_touches.append({
+                                    "object"    : obj["label"],
+                                    "risk"      : get_risk(obj["label"]),
+                                    "body_parts": parts,
+                                })
+
                     # Object interactions at fall moment
                     interactions = []
                     for obj in detected_objects:
@@ -400,25 +665,59 @@ def run():
                             "timing"              : "BEFORE_FALL" if present_before else "AFTER_FALL",
                             "likely_cause"        : present_before and touching,
                             "injury_risk"         : get_risk(obj["label"]),
+                            "body_parts"          : body_parts_touching_obj(kp_xy, kp_conf, obj["box"])
+                                                    if kp_xy is not None else [],
                         })
 
                     risk_order = {"HIGH":0,"MEDIUM":1,"LOW":2,"UNKNOWN":3}
                     interactions.sort(key=lambda x: (not x["touching"], risk_order[x["injury_risk"]]))
+
+                    # DURING_FALL snapshot
+                    dur_snap = None
+                    if during_touches and kp_xy is not None:
+                        snap = draw_touch_snapshot(
+                            frame, pbox, detected_objects, kp_xy, kp_conf,
+                            f"DURING FALL — Person {tid} @ {fall_time}s")
+                        dur_snap = f"{video_stem}_p{tid}_during_fall.jpg"
+                        cv2.imwrite(str(json_dir / dur_snap), snap)
 
                     incidents.append({
                         "person_track_id"    : tid,
                         "fall_frame"         : frame_idx,
                         "fall_time_sec"      : fall_time,
                         "was_sitting_on"     : sitting_summary,
+                        "first_floor_contact": first_floor_hit.get(tid),
                         "object_interactions": interactions,
+                        "body_part_touches"  : {
+                            "while_falling"         : while_falling_touches,
+                            "while_falling_snapshot": wf_snap_paths.get(tid),
+                            "during_fall"           : during_touches,
+                            "during_fall_snapshot"  : dur_snap,
+                            "after_fall"            : [],   # populated in subsequent frames
+                            "after_fall_snapshot"   : None, # set when first after-fall touch seen
+                        },
                     })
+                    active_fall_incidents[tid] = incidents[-1]
 
                     print(f"\n⚠️  FALL — Person {tid} @ {fall_time}s (frame {frame_idx})")
                     print(f"  Sitting on before fall: {[s['object'] for s in sitting_summary] or 'nothing detected'}")
+                    ffc = first_floor_hit.get(tid)
+                    if ffc:
+                        label = "FLAT FALL" if ffc["flat_fall"] else ffc["body_part"]
+                        print(f"  First floor contact:  {label} @ {ffc['time_sec']}s"
+                              f"  (parts: {', '.join(ffc['all_parts'])})")
+                    else:
+                        print(f"  First floor contact:  not yet detected")
                     for obj in interactions:
                         cause = " ← LIKELY CAUSE" if obj["likely_cause"] else ""
+                        bp_str = f"  body_parts=[{', '.join(obj['body_parts'])}]" if obj["body_parts"] else ""
                         print(f"  {obj['object']:20s}  touch={str(obj['touching']):5s}  "
-                              f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}")
+                              f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}{bp_str}")
+                    for phase_label, entries in [("While falling", while_falling_touches),
+                                                  ("During fall  ", during_touches)]:
+                        for e in entries:
+                            print(f"  [{phase_label}] {e['object']:16s} → {', '.join(e['body_parts'])}"
+                                  f"  (risk={e['risk']})")
 
                     # Annotate fall frame
                     vis = frame.copy()
@@ -439,6 +738,8 @@ def run():
                 # Recover
                 if tid in fallen_ids and upright_counts[tid] >= RECOVER_FRAMES:
                     fallen_ids.discard(tid)
+                    active_fall_incidents.pop(tid, None)
+                    fall_touch_log = [(t, e) for (t, e) in fall_touch_log if t != tid]
 
         frame_idx += 1
 
@@ -474,17 +775,38 @@ def run():
                 print(f"    {s['object']:20s}  {s['seconds_before_fall']}s before fall")
         else:
             print("    Nothing detected.")
+        ffc = inc.get("first_floor_contact")
+        if ffc:
+            label = "FLAT FALL" if ffc["flat_fall"] else ffc["body_part"]
+            print(f"  First floor contact: {label} @ {ffc['time_sec']}s"
+                  f"  (parts: {', '.join(ffc['all_parts'])})")
+        else:
+            print(f"  First floor contact: not detected")
         print(f"  Object interactions:")
         if inc["object_interactions"]:
             for obj in inc["object_interactions"]:
                 cause = " ← LIKELY CAUSE" if obj["likely_cause"] else ""
+                bp_str = f"  [{', '.join(obj['body_parts'])}]" if obj.get("body_parts") else ""
                 print(f"    {obj['object']:20s}  touch={str(obj['touching']):5s}  "
-                      f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}")
+                      f"timing={obj['timing']:12s}  risk={obj['injury_risk']}{cause}{bp_str}")
         else:
             print("    None.")
+        bpt = inc.get("body_part_touches", {})
+        has_any = any(bpt.get(k) for k in ("while_falling", "during_fall", "after_fall"))
+        if has_any:
+            print(f"  Body-part touches by phase:")
+            for phase_key, phase_label in [("while_falling", "While falling"),
+                                            ("during_fall",   "During fall  "),
+                                            ("after_fall",    "After fall   ")]:
+                for e in bpt.get(phase_key, []):
+                    print(f"    [{phase_label}] {e['object']:18s} → {', '.join(e['body_parts'])}"
+                          f"  (risk={e['risk']})")
 
-    #print("\nFull JSON:")
-    #print(json.dumps(incidents, indent=2))
+    # ── Save JSON report ──────────────────────────────────────────────────────
+    json_path  = json_dir / f"{video_stem}.json"
+    with open(json_path, "w") as f:
+        json.dump(incidents, f, indent=2)
+    print(f"\nJSON report saved: {json_path}")
 
 
 if __name__ == "__main__":
