@@ -8,13 +8,9 @@ Two detection methods:
   1. YOLO — detects known objects (chairs, bottles, etc.)
   2. Background subtraction — detects ANY large moving object (trees, unknown items)
 
-Logic:
-  1. Detect all non-person objects every frame using YOLOv8
-  2. Use background subtraction to catch objects YOLO doesn't know about
-  3. Track each object across frames using a simple IoU-based tracker
-  4. If the object's Y position drops rapidly over N frames → it is falling
-  5. If a person was near the object just before it started falling → person caused it
-  6. If the falling object's bbox overlaps the person bbox → it hit the person
+Outputs:
+  - Terminal summary
+  - Short video clip saved for each fall event (before + after)
 
 Usage:
   python falling_objects.py --video path/to/video.mp4
@@ -38,15 +34,18 @@ MAX_MISSED_FRAMES     = 10     # frames before a track is dropped
 HISTORY_FRAMES        = 10     # how many frames of position history to keep
 MIN_FALL_VELOCITY     = 4.0    # min pixels/frame downward to count as falling
 FALL_CONFIRM_FRAMES   = 5      # must be falling for this many frames to confirm
+FALL_COOLDOWN_SEC     = 2.0    # ignore new falls within this many seconds of the last
 
 # Cause / hit detection
 CAUSE_PROXIMITY_PX    = 120    # person within this distance just before fall → caused it
 CAUSE_LOOKBACK_FRAMES = 15     # how many frames before fall to check for person proximity
 HIT_IOU_THRESHOLD     = 0.05   # object bbox overlaps person bbox → hit
 
+# Clip saving
+CLIP_BUFFER_SEC       = 1.5    # seconds before AND after fall to include in clip
+
 # Background subtraction (for unknown objects like trees)
 BG_MIN_AREA           = 5000   # min contour area to count as a moving object (pixels²)
-                                # increase if too many false positives, decrease if missing objects
 
 # ── GEOMETRY HELPERS ──────────────────────────────────────────────────────────
 
@@ -72,21 +71,18 @@ def aspect_ratio(box):
 def detect_large_moving_regions(frame, bg_subtractor):
     """
     Detects large moving regions using background subtraction.
-    Returns list of bboxes [x1,y1,x2,y2] for any large unrecognized moving object.
-    Works for anything YOLO doesn't know — trees, furniture, unknown items.
+    Catches anything YOLO doesn't know about — trees, furniture, etc.
     """
     fg_mask = bg_subtractor.apply(frame)
-    # Clean up noise
     kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
     fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  kernel)
-
     contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     regions = []
     for cnt in contours:
         if cv2.contourArea(cnt) > BG_MIN_AREA:
-            x, y, w, h = cv2.boundingRect(cnt)
-            regions.append([x, y, x+w, y+h])
+            x, y, ww, hh = cv2.boundingRect(cnt)
+            regions.append([x, y, x+ww, y+hh])
     return regions
 
 # ── SIMPLE IoU TRACKER ────────────────────────────────────────────────────────
@@ -98,10 +94,8 @@ class Track:
         self.box           = box
         self.missed        = 0
         self.active        = True
-
-        cx, cy = bbox_center(box)
+        cx, cy             = bbox_center(box)
         self.history       = [(frame_idx, cx, cy, box, aspect_ratio(box))]
-
         self.fall_velocity = []
         self.is_falling    = False
         self.fall_frame    = None
@@ -129,9 +123,7 @@ class Track:
     def aspect_ratio_changed(self):
         if len(self.history) < HISTORY_FRAMES:
             return False
-        first_ar = self.history[0][4]
-        last_ar  = self.history[-1][4]
-        return first_ar < 0.8 and last_ar > 1.2
+        return self.history[0][4] < 0.8 and self.history[-1][4] > 1.2
 
 
 class Tracker:
@@ -140,8 +132,7 @@ class Tracker:
         self.next_id = 0
 
     def update(self, detections, frame_idx):
-        unmatched_dets    = list(range(len(detections)))
-        matched_track_ids = set()
+        unmatched_dets = list(range(len(detections)))
 
         for track in self.tracks:
             if not track.active:
@@ -158,7 +149,6 @@ class Tracker:
 
             if best_det is not None:
                 track.update(detections[best_det]["box"], frame_idx)
-                matched_track_ids.add(track.track_id)
                 unmatched_dets.remove(best_det)
             else:
                 track.missed += 1
@@ -200,10 +190,19 @@ def run(video_path: str):
     h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Video: {video_path.name}  |  {total} frames @ {fps:.1f}fps\n")
 
-    tracker      = Tracker()
-    bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40)
-    incidents    = []
-    frame_idx    = 0
+    tracker        = Tracker()
+    bg_subtractor  = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=40)
+    incidents      = []
+    last_fall_sec  = -999.0   # cooldown tracker
+
+    # Rolling frame buffer for clip extraction
+    max_buffer    = int(CLIP_BUFFER_SEC * fps) * 2 + 10
+    frame_buffer  = []   # list of (frame_idx, annotated_frame)
+
+    # Active clip writers: track_id → {"writer": cv2.VideoWriter, "end_frame": int, "path": str}
+    active_clips  = {}
+
+    frame_idx = 0
 
     while True:
         ret, frame = cap.read()
@@ -212,7 +211,7 @@ def run(video_path: str):
 
         results = obj_model(frame, verbose=False)[0]
 
-        # ── Separate people and YOLO objects ─────────────────────────────────
+        # ── People and YOLO objects ───────────────────────────────────────────
         person_boxes = []
         detections   = []
 
@@ -222,7 +221,6 @@ def run(video_path: str):
                 label  = obj_model.names[cls_id]
                 conf   = float(box.conf[0])
                 b      = box.xyxy[0].tolist()
-
                 if label == "person":
                     if conf > 0.4:
                         person_boxes.append(b)
@@ -230,17 +228,54 @@ def run(video_path: str):
                     if all(bbox_iou(b, pb) < 0.4 for pb in person_boxes):
                         detections.append({"label": label, "box": b})
 
-        # ── Background subtraction — catches unknown objects (trees, etc.) ───
+        # ── Background subtraction ────────────────────────────────────────────
         unknown_regions = detect_large_moving_regions(frame, bg_subtractor)
         for region in unknown_regions:
-            # Only add if not already covered by a YOLO detection or person
-            already_tracked = any(bbox_iou(region, d["box"]) > 0.3 for d in detections)
-            is_person       = any(bbox_iou(region, pb) > 0.3 for pb in person_boxes)
-            if not already_tracked and not is_person:
+            already = any(bbox_iou(region, d["box"]) > 0.3 for d in detections)
+            is_person = any(bbox_iou(region, pb) > 0.3 for pb in person_boxes)
+            if not already and not is_person:
                 detections.append({"label": "unknown_object", "box": region})
 
         # ── Update tracker ────────────────────────────────────────────────────
         active_tracks = tracker.update(detections, frame_idx)
+
+        # ── Draw all tracks ───────────────────────────────────────────────────
+        annotated = frame.copy()
+        for pb in person_boxes:
+            draw_box(annotated, pb, "person", (0, 200, 0), 2)
+
+        for track in active_tracks:
+            if track.is_falling:
+                color = (0, 0, 220)
+                label = f"{track.label} FALLING"
+            elif track.label == "unknown_object":
+                color = (0, 200, 255)
+                label = f"unknown [{track.track_id}]"
+            else:
+                color = (160, 160, 160)
+                label = f"{track.label} [{track.track_id}]"
+            draw_box(annotated, track.box, label, color, 1)
+
+            if len(track.history) >= 2:
+                cx1,cy1 = int(track.history[-2][1]), int(track.history[-2][2])
+                cx2,cy2 = int(track.history[-1][1]), int(track.history[-1][2])
+                cv2.arrowedLine(annotated, (cx1,cy1), (cx2,cy2), (0,255,255), 2)
+
+        cv2.putText(annotated, f"Frame {frame_idx}/{total}  |  Falls: {len(incidents)}",
+                    (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+        # ── Rolling buffer of annotated frames ────────────────────────────────
+        frame_buffer.append((frame_idx, annotated.copy()))
+        if len(frame_buffer) > max_buffer:
+            frame_buffer.pop(0)
+
+        # ── Write to any active clip writers ─────────────────────────────────
+        for tid, clip in list(active_clips.items()):
+            clip["writer"].write(annotated)
+            if frame_idx >= clip["end_frame"]:
+                clip["writer"].release()
+                print(f"   clip saved   : {clip['path']}")
+                del active_clips[tid]
 
         # ── Check each track for falling ──────────────────────────────────────
         for track in active_tracks:
@@ -254,11 +289,16 @@ def run(video_path: str):
             else:
                 track.fall_velocity = []
 
-            if len(track.fall_velocity) >= FALL_CONFIRM_FRAMES and not track.is_falling:
+            fall_time = round(frame_idx / fps, 2)
+
+            if (len(track.fall_velocity) >= FALL_CONFIRM_FRAMES
+                    and not track.is_falling
+                    and fall_time - last_fall_sec > FALL_COOLDOWN_SEC):
+
                 track.is_falling  = True
                 track.fall_frame  = frame_idx
                 track.fall_logged = True
-                fall_time         = round(frame_idx / fps, 2)
+                last_fall_sec     = fall_time
 
                 # Did a person cause it?
                 person_caused = False
@@ -292,37 +332,37 @@ def run(video_path: str):
                 print(f"   velocity     : {incident['avg_velocity_px_per_frame']} px/frame")
                 print(f"   tipped over  : {incident['aspect_ratio_changed']}")
                 print(f"   person caused: {person_caused}")
-                print(f"   hit person   : {hit_person}\n")
+                print(f"   hit person   : {hit_person}")
 
-        # ── Draw ──────────────────────────────────────────────────────────────
-        for pb in person_boxes:
-            draw_box(frame, pb, "person", (0, 200, 0), 2)
+                # ── Start clip writer ─────────────────────────────────────────
+                clip_path = str(video_path.parent /
+                                f"clip_{track.label}_t{fall_time}s.mp4")
+                writer = cv2.VideoWriter(
+                    clip_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
-        for track in active_tracks:
-            if track.is_falling:
-                color = (0, 0, 220)
-                label = f"{track.label} FALLING"
-            elif track.label == "unknown_object":
-                color = (0, 200, 255)
-                label = f"unknown [{track.track_id}]"
-            else:
-                color = (160, 160, 160)
-                label = f"{track.label} [{track.track_id}]"
-            draw_box(frame, track.box, label, color, 1)
+                # Write buffered pre-fall frames
+                clip_start = frame_idx - int(CLIP_BUFFER_SEC * fps)
+                for (fi, bf) in frame_buffer:
+                    if fi >= clip_start:
+                        writer.write(bf)
 
-            if len(track.history) >= 2:
-                cx1, cy1 = int(track.history[-2][1]), int(track.history[-2][2])
-                cx2, cy2 = int(track.history[-1][1]), int(track.history[-1][2])
-                cv2.arrowedLine(frame, (cx1,cy1), (cx2,cy2), (0,255,255), 2)
+                active_clips[track.track_id] = {
+                    "writer"   : writer,
+                    "end_frame": frame_idx + int(CLIP_BUFFER_SEC * fps),
+                    "path"     : clip_path,
+                }
 
-        cv2.putText(frame, f"Frame {frame_idx}/{total}  |  Falling objects: {len(incidents)}",
-                    (10, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
-
-        cv2.imshow("Falling Object Detection", frame)
+        # ── Display ───────────────────────────────────────────────────────────
+        cv2.imshow("Falling Object Detection", annotated)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
         frame_idx += 1
+
+    # Close any still-open clip writers
+    for tid, clip in active_clips.items():
+        clip["writer"].release()
+        print(f"   clip saved   : {clip['path']}")
 
     cap.release()
     for _ in range(5):
