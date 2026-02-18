@@ -343,6 +343,7 @@ def run():
     ankle_y_history       = {}   # tid -> list of y samples taken when person is upright
     floor_y_est           = {}   # tid -> estimated floor y coordinate
     first_floor_hit       = {}   # tid -> floor contact info dict
+    pre_fall_posture      = {}   # tid -> last confirmed posture before fall ("sitting"/"standing"/"lying")
 
     frame_idx = 0
 
@@ -471,6 +472,16 @@ def run():
                 else:
                     upright_counts[tid] += 1
                     horiz_counts[tid]    = 0
+
+                # ── Pre-fall posture (freeze when horiz_counts goes to 0) ────
+                if horiz_counts[tid] == 0:
+                    if person_is_sitting:
+                        pre_fall_posture[tid] = "sitting"
+                    elif is_horizontal(pbox) or (
+                            kp_xy is not None and is_fallen_pose(kp_xy, kp_conf, pbox)):
+                        pre_fall_posture[tid] = "lying"
+                    else:
+                        pre_fall_posture[tid] = "standing"
 
                 # ── Body-part touch logging (WHILE_FALLING / AFTER_FALL) ──────
                 fall_phase = None
@@ -686,6 +697,7 @@ def run():
                         "fall_frame"         : frame_idx,
                         "fall_time_sec"      : fall_time,
                         "was_sitting_on"     : sitting_summary,
+                        "pre_fall_posture"   : pre_fall_posture.get(tid, "unknown"),
                         "first_floor_contact": first_floor_hit.get(tid),
                         "object_interactions": interactions,
                         "body_part_touches"  : {
@@ -700,6 +712,7 @@ def run():
                     active_fall_incidents[tid] = incidents[-1]
 
                     print(f"\n⚠️  FALL — Person {tid} @ {fall_time}s (frame {frame_idx})")
+                    print(f"  Pre-fall posture:     {pre_fall_posture.get(tid, 'unknown')}")
                     print(f"  Sitting on before fall: {[s['object'] for s in sitting_summary] or 'nothing detected'}")
                     ffc = first_floor_hit.get(tid)
                     if ffc:
@@ -769,6 +782,7 @@ def run():
     print("\n" + "="*60)
     for inc in incidents:
         print(f"\nFALL — Person {inc['person_track_id']} @ {inc['fall_time_sec']}s")
+        print(f"  Pre-fall posture:    {inc.get('pre_fall_posture', 'unknown')}")
         print(f"  Sitting on (before fall):")
         if inc["was_sitting_on"]:
             for s in inc["was_sitting_on"]:
