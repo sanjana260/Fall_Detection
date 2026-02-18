@@ -169,8 +169,10 @@ def is_sitting_on(person_box, obj_box, kp_xy=None, kp_conf=None):
     person_cx        = (px1 + px2) / 2
     obj_cx           = (ox1 + ox2) / 2
     horizontal_match = abs(person_cx - obj_cx) < person_width * SITTING_HORIZONTAL_TOL
+    obj_is_below = (oy1 + oy2) / 2 > (py1 + py2) / 2
 
-    return vertical_match and horizontal_match
+
+    return vertical_match and horizontal_match and obj_is_below
 
 def is_fallen_pose(kp_xy, kp_conf, box):
     try:
@@ -250,31 +252,26 @@ def run():
         if not ret:
             break
 
-        # Object detection
-        obj_results      = obj_model(frame, verbose=False)[0]
-        # temporary — remove after debugging
-        if frame_idx < 90:
-            for obj in obj_results.boxes:
-                label = obj_model.names[int(obj.cls[0])]
-                conf  = float(obj.conf[0])
-                box   = obj.xyxy[0].tolist()
-                if label == "bird":
-                    print(f"f{frame_idx}: BIRD detected conf={conf:.2f} box={[round(v) for v in box]}")
-                    x1,y1,x2,y2 = [int(v) for v in box]
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        crop_big = cv2.resize(crop, (200, 200))  # enlarge so it's visible
-                        cv2.imshow(f"BIRD f{frame_idx} conf={conf:.2f}", crop_big)
-                        cv2.waitKey(500)  # show for 500ms then move on
+        # ── Detection ─────────────────────────────────────────────────────────
+        obj_results  = obj_model(frame, verbose=False)[0]
+        pose_results = pose_model(frame, verbose=False)[0]
+
+        # Build object list — skip persons, skip anything that heavily
+        # overlaps a detected person (avoids chair being labelled as person)
+        person_boxes = [b.xyxy[0].tolist() for b in pose_results.boxes] \
+                       if pose_results.boxes is not None else []
         detected_objects = []
         if obj_results.boxes is not None:
             for box in obj_results.boxes:
-                cls_id = int(box.cls[0])
-                label  = obj_model.names[cls_id]
+                cls_id  = int(box.cls[0])
+                label   = obj_model.names[cls_id]
                 if label == "person": continue
-                conf = float(box.conf[0])
+                conf    = float(box.conf[0])
                 if conf < OBJ_CONF_THRESHOLD: continue
-                detected_objects.append({"label": label, "box": box.xyxy[0].tolist(), "conf": conf})
+                obj_box = box.xyxy[0].tolist()
+                if any(iou(obj_box, pb) >= 0.3 for pb in person_boxes):
+                    continue
+                detected_objects.append({"label": label, "box": obj_box, "conf": conf})
 
         # Rolling pre-fall log
         for obj in detected_objects:
@@ -282,8 +279,7 @@ def run():
         cutoff = frame_idx - buffer_frames - 1
         pre_fall_log = [(f,l,b) for f,l,b in pre_fall_log if f > cutoff]
 
-        # Pose detection
-        pose_results = pose_model(frame, verbose=False)[0]
+        # ── Pose loop ─────────────────────────────────────────────────────────
         if pose_results.boxes is not None:
             for i, box in enumerate(pose_results.boxes):
                 tid  = int(box.id[0]) if box.id is not None else i
