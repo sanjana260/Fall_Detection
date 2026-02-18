@@ -54,6 +54,12 @@ FLAT_FALL_MIN_PARTS = 4    # this many parts at floor simultaneously → flat fa
 # the first *interesting* impact: head, knee, hip, palm, shoulder, etc.
 FLOOR_EXCLUDED_PARTS = {"left_ankle", "right_ankle"}
 
+# Falling object detection
+OBJ_TRACK_MAX_DIST   = 100  # px: max centroid distance to match same object across frames
+OBJ_HISTORY_FRAMES   = 20   # frames of bbox-center history per tracked object
+FALLING_OBJ_VEL_PX   = 5    # min downward cy velocity (px/frame) to qualify as falling
+FALLING_OBJ_CONFIRM  = 4    # consecutive frames needed to confirm object fall
+
 # Names for all 17 COCO keypoints
 KP_NAMES = {
     0:  "nose",
@@ -345,6 +351,12 @@ def run():
     first_floor_hit       = {}   # tid -> floor contact info dict
     pre_fall_posture      = {}   # tid -> last confirmed posture before fall ("sitting"/"standing"/"lying")
 
+    obj_tracks            = {}   # obj_track_id -> {label, history, falling, hit_person}
+    obj_track_next_id     = 0    # auto-increment counter for object tracks
+    falling_obj_incidents = []   # logged falling-object events
+    fired_obj_falls       = set()  # obj_track_ids already fired
+    active_falling_objs   = {}   # obj_track_id -> incident dict ref (for hit_person updates)
+
     frame_idx = 0
 
     while True:
@@ -378,6 +390,87 @@ def run():
             pre_fall_log.append((frame_idx, obj["label"], obj["box"]))
         cutoff = frame_idx - buffer_frames - 1
         pre_fall_log = [(f,l,b) for f,l,b in pre_fall_log if f > cutoff]
+
+        # ── Object tracking ───────────────────────────────────────────────────
+        matched_obj_tids = set()
+        for obj in detected_objects:
+            ox1, oy1, ox2, oy2 = obj["box"]
+            cx, cy = (ox1 + ox2) / 2, (oy1 + oy2) / 2
+            label  = obj["label"]
+
+            # Match to the closest existing track of same label
+            best_tid, best_dist = None, float("inf")
+            for otid, track in obj_tracks.items():
+                if track["label"] != label or not track["history"]:
+                    continue
+                lx, ly = track["history"][-1][1], track["history"][-1][2]
+                d = np.sqrt((cx - lx)**2 + (cy - ly)**2)
+                if d < best_dist and d < OBJ_TRACK_MAX_DIST:
+                    best_dist = d
+                    best_tid  = otid
+
+            if best_tid is not None and best_tid not in matched_obj_tids:
+                matched_obj_tids.add(best_tid)
+                track = obj_tracks[best_tid]
+            else:
+                # New object track
+                best_tid = obj_track_next_id
+                obj_track_next_id += 1
+                track = {"label": label, "history": [], "falling": False, "hit_person": False}
+                obj_tracks[best_tid] = track
+
+            track["history"].append((frame_idx, cx, cy, list(obj["box"])))
+            if len(track["history"]) > OBJ_HISTORY_FRAMES:
+                track["history"] = track["history"][-OBJ_HISTORY_FRAMES:]
+
+        # Expire stale tracks not seen recently
+        obj_tracks = {otid: t for otid, t in obj_tracks.items()
+                      if t["history"] and t["history"][-1][0] >= frame_idx - OBJ_HISTORY_FRAMES}
+
+        # ── Falling object detection ───────────────────────────────────────────
+        for otid, track in obj_tracks.items():
+            hist = track["history"]
+            if not hist:
+                continue
+
+            # Update hit_person for already-confirmed falling objects
+            if track["falling"] and not track["hit_person"] and otid in active_falling_objs:
+                last_box = hist[-1][3]
+                if any(iou(last_box, pb) > TOUCH_IOU_THRESHOLD
+                       or center_dist(last_box, pb) < PROXIMITY_PX
+                       for pb in person_boxes):
+                    track["hit_person"] = True
+                    active_falling_objs[otid]["hit_person"] = True
+                continue
+
+            if track["falling"] or otid in fired_obj_falls or len(hist) < FALLING_OBJ_CONFIRM:
+                continue
+
+            # Check last N frames for consistent downward (positive cy) velocity
+            recent = hist[-FALLING_OBJ_CONFIRM:]
+            vels   = [recent[i+1][2] - recent[i][2] for i in range(len(recent) - 1)]
+            if all(v >= FALLING_OBJ_VEL_PX for v in vels):
+                track["falling"] = True
+                fired_obj_falls.add(otid)
+
+                last_box      = hist[-1][3]
+                person_caused = any(
+                    iou(last_box, pb) > TOUCH_IOU_THRESHOLD
+                    or center_dist(last_box, pb) < PROXIMITY_PX
+                    for pb in person_boxes
+                )
+                fo_incident = {
+                    "object"          : track["label"] if track["label"] else "unknown",
+                    "fell_at_frame"   : frame_idx,
+                    "fell_at_time_sec": round(frame_idx / fps, 2),
+                    "person_caused_it": person_caused,
+                    "hit_person"      : False,
+                    "injury_risk"     : get_risk(track["label"]),
+                }
+                falling_obj_incidents.append(fo_incident)
+                active_falling_objs[otid] = fo_incident
+                print(f"\n  [FALLING OBJECT] {fo_incident['object']} @ {fo_incident['fell_at_time_sec']}s"
+                      f"  person_caused={person_caused}  risk={fo_incident['injury_risk']}")
 
         # ── Pose loop ─────────────────────────────────────────────────────────
         if pose_results.boxes is not None:
@@ -674,7 +767,6 @@ def run():
                             "proximity_px"        : round(distance, 1),
                             "present_before_fall" : present_before,
                             "timing"              : "BEFORE_FALL" if present_before else "AFTER_FALL",
-                            "likely_cause"        : present_before and touching,
                             "injury_risk"         : get_risk(obj["label"]),
                             "body_parts"          : body_parts_touching_obj(kp_xy, kp_conf, obj["box"])
                                                     if kp_xy is not None else [],
@@ -720,9 +812,6 @@ def run():
                     _ffc_label = ("flat" if _ffc_data["flat_fall"] else _ffc_data["body_part"]) \
                                  if _ffc_data else None
 
-                    _likely_causes = [obj["object"] for obj in interactions
-                                      if obj.get("likely_cause")]
-
                     summary = {
                         "fell"                  : True,
                         "fall_time_sec"         : fall_time,
@@ -734,9 +823,9 @@ def run():
                             "during_fall"   : [e["object"] for e in during_touches],
                             "after_fall"    : [],   # populated in later frames
                         },
-                        "first_floor_contact"   : _ffc_label,
-                        "highest_risk_body_part": _highest_risk,
-                        "likely_cause_objects"  : _likely_causes,
+                        "first_floor_contact"        : _ffc_label,
+                        "highest_risk_body_part"     : _highest_risk,
+                        "falling_objects_during_fall": [],  # populated at end of run
                     }
 
                     incidents.append({
@@ -774,8 +863,6 @@ def run():
                               f" → {_highest_risk['object']} ({_highest_risk['risk']})")
                     else:
                         print(f"  Highest-risk touch : none detected")
-                    print(f"  Likely cause       : {', '.join(_likely_causes) or 'unknown'}")
-
                     # Annotate fall frame
                     vis = frame.copy()
                     RISK_COLORS = {"HIGH":(0,0,220),"MEDIUM":(0,140,255),"LOW":(0,200,150),"UNKNOWN":(160,160,160)}
@@ -822,7 +909,7 @@ def run():
         cv2.waitKey(1)
     cv2.destroyAllWindows()
 
-    # ── Finalize summaries with after_fall data, then print ───────────────────
+    # ── Finalize summaries with after_fall + falling-object data ─────────────
     _risk_order_final = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
     for inc in incidents:
         s   = inc.get("summary", {})
@@ -853,6 +940,16 @@ def run():
         if _ffc:
             s["first_floor_contact"] = "flat" if _ffc["flat_fall"] else _ffc["body_part"]
 
+        # Populate falling objects that happened near this person fall (±buffer window)
+        fall_frm = inc["fall_frame"]
+        s["falling_objects_during_fall"] = [
+            {"object"    : fo["object"],
+             "hit_person": fo["hit_person"],
+             "injury_risk": fo["injury_risk"]}
+            for fo in falling_obj_incidents
+            if abs(fo["fell_at_frame"] - fall_frm) <= buffer_frames
+        ]
+
     print("\n" + "="*60)
     print("FALL SUMMARY REPORT")
     print("="*60)
@@ -860,6 +957,7 @@ def run():
         s  = inc.get("summary", {})
         ot = s.get("objects_touching", {})
         hr = s.get("highest_risk_body_part")
+        fo_list = s.get("falling_objects_during_fall", [])
         print(f"\nFALL — Person {inc['person_track_id']} @ {inc['fall_time_sec']}s")
         print(f"  Pre-fall posture   : {s.get('pre_fall_posture', 'unknown')}")
         print(f"  Was sitting on     : {', '.join(s.get('was_sitting_on', [])) or 'nothing detected'}")
@@ -874,12 +972,31 @@ def run():
                   f" → {hr['object']} ({hr['risk']})")
         else:
             print(f"  Highest-risk touch : none detected")
-        print(f"  Likely cause       : {', '.join(s.get('likely_cause_objects', [])) or 'unknown'}")
+        if fo_list:
+            fo_str = ", ".join(
+                f"{f['object']} (hit_person={f['hit_person']}, risk={f['injury_risk']})"
+                for f in fo_list
+            )
+            print(f"  Falling objects    : {fo_str}")
+        else:
+            print(f"  Falling objects    : none near this fall")
+
+    if falling_obj_incidents:
+        print(f"\nFALLING OBJECT INCIDENTS ({len(falling_obj_incidents)} total):")
+        for fo in falling_obj_incidents:
+            print(f"  {fo['object']:20s} @ {fo['fell_at_time_sec']}s"
+                  f"  person_caused={str(fo['person_caused_it']):5s}"
+                  f"  hit_person={str(fo['hit_person']):5s}"
+                  f"  risk={fo['injury_risk']}")
 
     # ── Save JSON report ──────────────────────────────────────────────────────
-    json_path  = json_dir / f"{video_stem}.json"
+    report = {
+        "person_fall_incidents"   : incidents,
+        "falling_object_incidents": falling_obj_incidents,
+    }
+    json_path = json_dir / f"{video_stem}.json"
     with open(json_path, "w") as f:
-        json.dump(incidents, f, indent=2)
+        json.dump(report, f, indent=2)
     print(f"\nJSON report saved: {json_path}")
 
 
