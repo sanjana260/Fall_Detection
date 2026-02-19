@@ -1012,6 +1012,3 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
 
 
 output_dir, people = run_fall_detection_live(0, output_filename='test0.mp4')
-
-if __name__ == "__main__":
-       output_dir, people = run_fall_detection_live(0, output_filename='test0.mp4')
