@@ -13,6 +13,7 @@ import time
 mps_device = torch.device('mps')
 import argparse
 import time
+from llm import llm
 from hazard_module import HazardModule
 from hazard.types import PersonTrack
 from hazard.water_detector import WaterConfig
@@ -57,8 +58,27 @@ PERSON_MATCH_DIST     = 80
 def _fmt_topk(topk):
     return ", ".join([f"{d['label']}:{d['prob']:.2f}" for d in topk])
 
+output_path = os.path.join("Outputs", 'vigilens_live.mp4')
+people_images_folder = os.path.splitext('vigilens_live.mp4')[0]
+people_output_dir = os.path.join('Outputs', people_images_folder + "/people")
+if os.path.exists(people_output_dir):
+    shutil.rmtree(people_output_dir)
+os.makedirs(people_output_dir)
 
-def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
+fall_output_dir = os.path.join('Outputs', people_images_folder + "/falls")
+if os.path.exists(fall_output_dir):
+    shutil.rmtree(fall_output_dir)
+os.makedirs(fall_output_dir)
+
+json_dir = os.path.join('Outputs', people_images_folder, "objects")
+print(json_dir)
+if os.path.exists(json_dir):
+    shutil.rmtree(json_dir)
+os.makedirs(json_dir)
+
+
+def run_fall_detection_live(input_video_path, min_area = 2000):
+    # global fall_output_dir, json_dir, output_path, people_output_dir, people_images_folder
     """
     Runs fall detection on a given video and writes the annotated output to the 'Outputs' folder.
 
@@ -72,23 +92,7 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
     os.makedirs("Outputs", exist_ok=True)
     print('START')
     # input_video_filename = os.path.basename(input_video_path)
-    output_path = os.path.join("Outputs", output_filename)
-    people_images_folder = os.path.splitext(output_filename)[0]
-    people_output_dir = os.path.join('Outputs', people_images_folder + "/people")
-    if os.path.exists(people_output_dir):
-        shutil.rmtree(people_output_dir)
-    os.makedirs(people_output_dir)
-
-    fall_output_dir = os.path.join('Outputs', people_images_folder + "/falls")
-    if os.path.exists(fall_output_dir):
-        shutil.rmtree(fall_output_dir)
-    os.makedirs(fall_output_dir)
     
-    json_dir = os.path.join('Outputs', people_images_folder, "objects")
-    print(json_dir)
-    if os.path.exists(json_dir):
-        shutil.rmtree(json_dir)
-    os.makedirs(json_dir)
 
     cap = cv2.VideoCapture(input_video_path, cv2.CAP_AVFOUNDATION)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -625,7 +629,7 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
                             'person_id':str(person_id),
                             'fall_frame':people[person_id]['fall_frame'],
                             'head_speed':round((frames[0]['head_y'] - frames[-1]['head_y'])/dy,2),
-                            'head_accel':round(accel_head,2),
+                            'head_accel':round(accel_head,2) if type(accel_head)==float else "-",
                             'shoulder_speed':round((frames[0]['shoulder_y'] - frames[-1]['shoulder_y'])/dy,2),
                             'fall_start':(frames[0]['frame_id'],frames[0]['timestamp']),
                             'fall_end':(frames[-1]['frame_id'],frames[-1]['timestamp']),
@@ -1070,6 +1074,9 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
                         })
                         # INSERT_YOUR_CODE
                         # Write the updated dictionary with added fall_object_interaction to the same JSON file
+                        json_path = os.path.join(fall_output_dir, people[tid]['falls'][-1]['fall_json'])
+                        # summary = llm(json_path)
+                        # fall_outputs_stored['Summary'] = summary
                         with open(os.path.join(fall_output_dir, people[tid]['falls'][-1]['fall_json']), 'w') as file:
                             json.dump(convert_to_str(fall_outputs_stored), file, indent=4)
                             
@@ -1362,4 +1369,4 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
     return output_path,people
 
 
-output_dir, people = run_fall_detection_live(0, output_filename='test0.mp4')
+# output_dir, people = run_fall_detection_live(0, output_filename='test0.mp4')
