@@ -13,6 +13,11 @@ import time
 mps_device = torch.device('mps')
 import argparse
 import time
+from hazard_module import HazardModule
+from hazard.types import PersonTrack
+from hazard.water_detector import WaterConfig
+
+from hazard.test_video_hazards import *
 
 import cv2
 
@@ -132,6 +137,7 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
     falling_obj_incidents = []   # logged falling-object events
     fired_obj_falls       = set()  # obj_track_ids already fired
     active_falling_objs   = {}   # obj_track_id -> incident dict ref (for hit_person updates)
+    sitting_confidence = {}
 
     frame_idx = 0
     ##################################################
@@ -183,6 +189,19 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
     people = {}
     prev_timestamp = 0
     frame_id=0
+
+    ################## Water detection ##################
+    # hz = HazardModule(
+    #     water_cfg=WaterConfig(
+    #         mode="heuristic",     # "auto" will try GDINO+SAM then fallback, but your GDINO class currently raises
+    #         device="cpu",
+    #         min_area=500,
+    #     )
+    # )
+    
+
+    
+    ######################################################
     while cap.isOpened():
         ret, frame = cap.read()
         recovery = False
@@ -192,6 +211,56 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
 
         frame_org = frame.copy()
         frame_height, frame_width = frame.shape[:2]
+
+        ###################### Water detection ###########################
+        # result = hz.process_frame(frame, people, t = frame_id/fps, fall_events=None)
+
+        # vis = frame.copy()
+
+        # for det in result.hazards:
+        #     if (det.hazard_type or "").lower() != "water":
+        #         continue
+
+        #     mask = det.mask
+        #     vis = overlay_mask(vis, mask, alpha=0.35)
+
+        #     bbox = det.bbox
+        #     if bbox is None and mask is not None:
+        #         bbox = mask_to_bbox(mask)
+
+        #     sev = getattr(det, "severity", "unknown")
+        #     ar = getattr(det, "area_ratio", None)
+
+        #     if bbox is not None:
+        #         x1, y1, x2, y2 = map(int, bbox)
+        #         cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+        #         if ar is None:
+        #             label = f"water sev={sev}"
+        #         else:
+        #             label = f"water sev={sev} ar={float(ar):.4f}"
+
+        #         cv2.putText(
+        #             frame,
+        #             label,
+        #             (x1, max(0, y1 - 8)),
+        #             cv2.FONT_HERSHEY_SIMPLEX,
+        #             0.6,
+        #             (255, 0, 0),
+        #             2,
+        #         )
+        # # Optional: show scene alert text
+        # if "water" in result.scene_alerts:
+        #     cv2.putText(
+        #         frame,
+        #         f"SCENE ALERT: WATER ({result.scene_alerts['water']})",
+        #         (20, 35),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         1.0,
+        #         (255, 0, 0),
+        #         2,
+        #     )
+        ###################################################################
         # results = model(frame)
         results = model.track(frame, persist=True, tracker='./configs/bytetrack.yaml' , conf=0.35)
 
@@ -480,7 +549,7 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
                             'vertical':str(is_vertical),
                             'angle':float(angle),
                             'angle_change':float(angle_change),
-                            'head_y':float(head_y),
+                            'head_y': float(head_y),
                             'shoulder_y':float(shoulder_center[1]),
                             'head_change':float(head_change),
                             'fall_ongoing':str(people[person_id]['fall_ongoing']),
@@ -555,9 +624,9 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
                             'fall_id':len(people[person_id]['falls']),
                             'person_id':str(person_id),
                             'fall_frame':people[person_id]['fall_frame'],
-                            'head_speed':(frames[0]['head_y'] - frames[-1]['head_y'])/dy,
-                            'head_accel':accel_head,
-                            'shoulder_speed':(frames[0]['shoulder_y'] - frames[-1]['shoulder_y'])/dy,
+                            'head_speed':round((frames[0]['head_y'] - frames[-1]['head_y'])/dy,2),
+                            'head_accel':round(accel_head,2),
+                            'shoulder_speed':round((frames[0]['shoulder_y'] - frames[-1]['shoulder_y'])/dy,2),
                             'fall_start':(frames[0]['frame_id'],frames[0]['timestamp']),
                             'fall_end':(frames[-1]['frame_id'],frames[-1]['timestamp']),
                             'fall_video':fall_video_filename,
@@ -689,9 +758,12 @@ def run_fall_detection_live(input_video_path, output_filename, min_area = 2000):
                     # ── Pre-fall posture (freeze when horiz_counts goes to 0) ────
                     if horiz_counts[tid] == 0:
                         if person_is_sitting:
+                            sitting_confidence[tid] = sitting_confidence.get(tid, 0) + 1
+                        else:
+                            sitting_confidence[tid] = max(0, sitting_confidence.get(tid, 0) - 1)
+
+                        if sitting_confidence.get(tid, 0) >= 5:
                             pre_fall_posture[tid] = "sitting"
-                        elif is_horizontal:
-                            pre_fall_posture[tid] = "lying"
                         else:
                             pre_fall_posture[tid] = "standing"
 
