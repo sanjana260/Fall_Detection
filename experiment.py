@@ -111,6 +111,59 @@ def get_kp(keypoints, idx):
     # kp is [x, y] from .xy, conf from .conf
     return kp if kp[0] > 0 and kp[1] > 0 else None
 
+
+def are_knees_bent(keypoints_xy, keypoints_conf):
+    """
+    Returns True if knees are bent, by checking the angle at the knee
+    between the hip-knee and knee-ankle vectors.
+    Straight leg = ~180 degrees, bent = noticeably less.
+    """
+    try:
+        def knee_angle(hip, knee, ankle):
+            v1 = np.array([hip[0]   - knee[0], hip[1]   - knee[1]])
+            v2 = np.array([ankle[0] - knee[0], ankle[1] - knee[1]])
+            cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+            cos_a = np.clip(cos_a, -1.0, 1.0)
+            return np.degrees(np.arccos(cos_a))
+
+        lh_conf = keypoints_conf[KP_LEFT_HIP]
+        rh_conf = keypoints_conf[KP_RIGHT_HIP]
+        lk_conf = keypoints_conf[KP_LEFT_KNEE]
+        rk_conf = keypoints_conf[KP_RIGHT_KNEE]
+        la_conf = keypoints_conf[KP_LEFT_ANKLE]
+        ra_conf = keypoints_conf[KP_RIGHT_ANKLE]
+
+        angles = []
+
+        if lh_conf > KP_CONF_THRESHOLD and lk_conf > KP_CONF_THRESHOLD and la_conf > KP_CONF_THRESHOLD:
+            angle = knee_angle(
+                keypoints_xy[KP_LEFT_HIP],
+                keypoints_xy[KP_LEFT_KNEE],
+                keypoints_xy[KP_LEFT_ANKLE]
+            )
+            angles.append(angle)
+
+        if rh_conf > KP_CONF_THRESHOLD and rk_conf > KP_CONF_THRESHOLD and ra_conf > KP_CONF_THRESHOLD:
+            angle = knee_angle(
+                keypoints_xy[KP_RIGHT_HIP],
+                keypoints_xy[KP_RIGHT_KNEE],
+                keypoints_xy[KP_RIGHT_ANKLE]
+            )
+            angles.append(angle)
+
+        if not angles:
+            return False
+
+        avg_angle = np.mean(angles)
+
+        # Straight leg: ~160-180 degrees
+        # Sitting bent: ~80-110 degrees
+        # Deeply bent/crouching: <80 degrees
+        return avg_angle < 150
+
+    except Exception:
+        return False
+
 def is_sitting_pose(keypoints_xy, keypoints_conf):
     """
     Uses hip and knee keypoints to detect sitting.
@@ -165,7 +218,13 @@ def is_sitting_pose(keypoints_xy, keypoints_conf):
             torso_upright  = torso_vertical > 20  # shoulders clearly above hips
 
         # Sitting: knees close to hip height AND torso upright
-        is_sitting = (knee_hip_diff < 80) and torso_upright
+        # Replace the raw pixel threshold with a ratio
+
+        torso_height = avg_hip_y - avg_shoulder_y if shoulder_ys else (py2 - py1) * 0.4
+        if torso_height < 10:
+            return False
+        knee_hip_ratio = knee_hip_diff / torso_height
+        is_sitting = (knee_hip_ratio < 0.6) and torso_upright and are_knees_bent(keypoints_xy, keypoints_conf)
 
         return is_sitting
 
@@ -193,7 +252,7 @@ def is_sitting_on(person_box, obj_box, kp_xy=None, kp_conf=None):
             seat_y = float(np.mean(hip_ys))
 
     # Hip should sit somewhere within the object's bounding box (with slack)
-    vertical_match   = (oy1 - 30 <= seat_y <= oy2 + 10)
+    vertical_match = (oy1 - 15 <= seat_y <= oy2 + 5) and (seat_y >= oy1)
     person_cx        = (px1 + px2) / 2
     obj_cx           = (ox1 + ox2) / 2
     horizontal_match = abs(person_cx - obj_cx) < person_width * SITTING_HORIZONTAL_TOL
@@ -350,6 +409,7 @@ def run():
     floor_y_est           = {}   # tid -> estimated floor y coordinate
     first_floor_hit       = {}   # tid -> floor contact info dict
     pre_fall_posture      = {}   # tid -> last confirmed posture before fall ("sitting"/"standing"/"lying")
+    sitting_confidence    = {} #ADDDDD
 
     obj_tracks            = {}   # obj_track_id -> {label, history, falling, hit_person}
     obj_track_next_id     = 0    # auto-increment counter for object tracks
@@ -542,20 +602,16 @@ def run():
                 sitting_log = [(f,t,l,b) for f,t,l,b in sitting_log if f > cutoff]
 
                 # ── Floor y estimation (only when upright and not sitting) ────
-                if horiz_counts[tid] == 0 and not person_is_sitting:
-                    # Use bbox bottom as proxy; prefer ankle keypoints if available
-                    y_sample = pbox[3]
-                    if kp_xy is not None:
-                        for ak_idx in (KP_LEFT_ANKLE, KP_RIGHT_ANKLE):
-                            if kp_conf[ak_idx] > KP_CONF_THRESHOLD:
-                                ay = float(kp_xy[ak_idx][1])
-                                if ay > 0:
-                                    y_sample = max(y_sample, ay)
-                    history = ankle_y_history.setdefault(tid, [])
-                    history.append(y_sample)
-                    if len(history) > 60:
-                        ankle_y_history[tid] = history[-60:]
-                    floor_y_est[tid] = max(history) + 5  # small buffer below lowest point
+                if horiz_counts[tid] == 0:
+                    if person_is_sitting:
+                        sitting_confidence[tid] = sitting_confidence.get(tid, 0) + 1
+                    else:
+                        sitting_confidence[tid] = 0
+
+                    if sitting_confidence.get(tid, 0) >= 5:  # sitting for 5+ consecutive frames
+                        pre_fall_posture[tid] = "sitting"
+                    else:
+                        pre_fall_posture[tid] = "standing"
 
                 # ── Fall detection ────────────────────────────
                 if is_fallen_pose(kp_xy, kp_conf, pbox) if kp_xy is not None else is_horizontal(pbox):
@@ -569,10 +625,12 @@ def run():
                 # ── Pre-fall posture (freeze when horiz_counts goes to 0) ────
                 if horiz_counts[tid] == 0:
                     if person_is_sitting:
+                        sitting_confidence[tid] = sitting_confidence.get(tid, 0) + 1
+                    else:
+                        sitting_confidence[tid] = max(0, sitting_confidence.get(tid, 0) - 1)
+
+                    if sitting_confidence.get(tid, 0) >= 5:
                         pre_fall_posture[tid] = "sitting"
-                    elif is_horizontal(pbox) or (
-                            kp_xy is not None and is_fallen_pose(kp_xy, kp_conf, pbox)):
-                        pre_fall_posture[tid] = "lying"
                     else:
                         pre_fall_posture[tid] = "standing"
 
